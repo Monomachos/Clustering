@@ -1,0 +1,1015 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import csv
+import time
+
+# Import PuLP modeler functions
+get_ipython().system('pip install pulp')
+import pulp as plp
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+#from google.colab import drive # this is for exporting csv file with constructed targets into google drive
+
+from sklearn.metrics import pairwise_distances
+import networkx as nx
+from sklearn.cluster import KMeans
+
+
+# In[2]:
+
+
+import gurobipy
+solver_list = plp.listSolvers(onlyAvailable=True)
+print(solver_list)
+
+solver_model = plp.GUROBI_CMD(path="")
+
+
+# In[3]:
+
+
+# define auxiliary functions
+
+def compute_big_M_and_bisection(number_of_dimensions,
+                                  number_of_clusters,
+                                  data_points_per_cluster,
+                                  sigma,
+                                error_tolerance,
+                                seed_number,
+                                bigMIncluded):
+
+    # Set the seed
+    np.random.seed(seed_number)  # You can use any integer value as the seed
+
+    X_num = np.concatenate(
+                (
+                    np.random.normal(50, sigma, size=(data_points_per_cluster, number_of_dimensions)),
+                    np.random.normal(0, sigma, size=(data_points_per_cluster, number_of_dimensions)),
+                    np.random.normal(-50, sigma, size=(data_points_per_cluster, number_of_dimensions))
+                    ,np.resize([[1,-1]], [data_points_per_cluster, number_of_dimensions]) * np.random.normal(50, sigma, size=(data_points_per_cluster, number_of_dimensions))
+                    #,np.resize([[-1,1]], [data_points_per_cluster, number_of_dimensions]) * np.random.normal(50, sigma, size=(data_points_per_cluster, number_of_dimensions))
+                )
+            )
+    
+    z_vars = None
+    y_vars = None
+    
+    probName = "ClusteringProblem" + str(number_of_dimensions) + "_" + str(number_of_clusters) + "_" + str(data_points_per_cluster) + "_" + str(sigma)
+        
+    # Create the 'prob' variable to contain the problem data
+    prob = plp.LpProblem(probName, plp.LpMinimize)
+        
+    if (bigMIncluded):
+
+        # calculate the number of points contained in X_num
+        number_of_points = X_num.shape[0]
+
+        # S set of auxilliary functions is defined:
+        def pos_restr(i, j, l, X_num,M):
+            z_name = f"z_{l}_{j}"
+            y_name = f"y_{i}_{j}"
+            x_value = X_num[i-1,l-1]
+
+            return z_vars[z_name]-x_value-alpha_vars["alpha"] + M * y_vars[y_name] - M
+
+        def neg_restr(i, j, l, X_num,M):
+            z_name = f"z_{l}_{j}"
+            y_name = f"y_{i}_{j}"
+            x_value = X_num[i-1,l-1]
+
+            return -z_vars[z_name]+x_value-alpha_vars["alpha"] + M * y_vars[y_name] - M
+
+        def equal_restr(i,number_of_clusters):
+            result_sum = ""
+
+            for j in range(1, number_of_clusters + 1):
+                y_name = f"y_{i}_{j}"
+                result_sum += y_vars[y_name]
+
+            return result_sum-1
+        
+        
+
+        # create the names for the variables
+        z_names = [f"z_{l}_{j}" for j in range(1, number_of_clusters + 1) for l in range(1, number_of_dimensions + 1)]
+        y_names = [f"y_{i}_{j}" for j in range(1, number_of_clusters + 1) for i in range(1, number_of_points + 1)]
+        x_names = [f"x_{l}_{i}" for i in range(1, number_of_points + 1) for l in range(1, number_of_dimensions + 1)]
+        alpha_names = ["alpha"]
+    
+        # define the size of M (todo: this has to be made dependent on the X_num instances)
+        M = np.ceil(X_num.max() - X_num.min()) + 1
+    
+        # A dictionary called 'z_vars' is created to contain the referenced Variables
+        z_vars = plp.LpVariable.dicts("z_variables", z_names)
+    
+        # A dictionary called 'y_vars' is created to contain the referenced Variables
+        y_vars = plp.LpVariable.dicts("y_variables", y_names,0, 1, plp.LpInteger)
+    
+        # A dictionary called 'y_vars' is created to contain the referenced Variables
+        alpha_vars = plp.LpVariable.dicts("alpha_variable", alpha_names)
+    
+    
+    
+        # The objective function is added to 'prob' first
+        prob += (alpha_vars["alpha"],
+            "Total Cost of Ingredients per can",
+        )
+    
+        # let's add the constraints to 'prob':
+        for i in range(1,number_of_points + 1):
+            prob += equal_restr(i,number_of_clusters) == 0, "equality_restr_"+f"{i}",
+    
+        # let's add the pos. constraints are added to 'prob':
+        for i in range(1,number_of_points + 1):
+            for j in range(1,number_of_clusters + 1):
+                for l in range(1,number_of_dimensions + 1):
+                    prob += (
+                        pos_restr(i,j,l,X_num,M) <= 0.0,
+                        "pos_restr_"+f"{i}_{j}_{l}",
+                    )
+    
+        # let's add the neg. constraints to 'prob':
+        for i in range(1,number_of_points + 1):
+            for j in range(1,number_of_clusters + 1):
+                for l in range(1,number_of_dimensions + 1):
+                    prob += (
+                        neg_restr(i,j,l,X_num,M) <= 0.0,
+                        "neg_restr_"+f"{i}_{j}_{l}",
+                    )
+    
+        # The problem data is written to an .lp file
+        prob.writeLP(probName + ".lp")
+
+
+
+    # ----------------------------------
+    # Implementation of bisection approach
+    # ----------------------------------
+
+    #####
+    # 0 #
+    #####
+
+    # calculate pairwise distances using max norm
+    distance = pairwise_distances(X_num, metric="chebyshev")
+
+    # transform to numpy matrix
+    distance_matrix = np.asmatrix(distance)
+    distance_matrix_min_max = np.copy(distance_matrix)
+
+    # replace diagonal by NAN in order to be able to calculate lower bound (initialization)
+    np.fill_diagonal(distance_matrix_min_max, np.NAN)
+
+    # initialization of lower bound (NaN is ignored)
+    lower_bound = np.nanmin(distance_matrix_min_max)
+
+    # upper bound initialization is optimized based on k-means algorithm as shown below.
+    # upper_bound = np.nanmax(distance_matrix_min_max)
+
+    #####
+    # 1 #
+    #####
+
+    # calculate duration t1-t0
+    k0 = time.time()
+
+    # apply k-means algorithm to dataset
+    model = KMeans(n_clusters = number_of_clusters, n_init=10)
+    model.fit(X_num)
+
+
+    k1 = time.time()
+
+
+    # extract labels and cluster centers
+    labels = model.labels_
+    centers = model.cluster_centers_
+    kMeans_value = model.inertia_
+    k_time = k1-k0 
+    
+    
+    # ----------------------------------
+    # Implementation of kMeans Max norm approach
+    # ----------------------------------
+
+    kMeansMax0 = time.time()
+    
+    # Initialization of algorithm by means of kMeans algorithm, i.e. use kMeans cluster center as starting point
+    kMeansMaxCenters = centers
+    # assign each data point to the closest cluster center
+    kMeansMaxLabels = np.argmin([np.linalg.norm(X_num - kMeansMaxCenters[i],np.inf,axis=1) for i in range(number_of_clusters)],axis=0)
+    
+    # calculation of value for current feasible solution
+    kMeansMax_value = 0
+
+    for i in range(number_of_clusters):
+        tmp_cluster = X_num[kMeansMaxLabels==i]
+        tmp_center = kMeansMaxCenters[i]
+
+        kMeansMax_value = max(
+            max(np.linalg.norm(tmp_cluster-tmp_center, np.inf,axis=1))
+            , kMeansMax_value
+        )
+    
+    # store value of the current iteration to check the stop criteria
+    kMeansMax_value_previous = kMeansMax_value
+
+    # do while loop
+    while True:
+        # calculate new cluster centers based on the new cluster allocation
+        kMeansMaxCenters = np.array([(X_num[kMeansMaxLabels==i].min(axis=0) + X_num[kMeansMaxLabels==i].max(axis=0)) / 2 for i in range(number_of_clusters)])
+        # calculate new cluster allocation based on the new cluster centers
+        kMeansMaxLabels = np.argmin([np.linalg.norm(X_num - kMeansMaxCenters[i],np.inf,axis=1) for i in range(number_of_clusters)],axis=0)
+
+        # calculation of value after update of cluster centers and new cluster allocation.
+        kMeansMax_value = 0
+
+        for i in range(number_of_clusters):
+            tmp_cluster = X_num[kMeansMaxLabels==i]
+            tmp_center = kMeansMaxCenters[i]
+
+            kMeansMax_value = max(
+                max(np.linalg.norm(tmp_cluster-tmp_center, np.inf,axis=1))
+                , kMeansMax_value
+            )
+        # print current value and previous value
+        print(str(kMeansMax_value) + '_' + str(kMeansMax_value_previous))
+        
+        # if difference is smaller than error_tolerance, the algorithm will be stopped.
+        if abs(kMeansMax_value - kMeansMax_value_previous) < error_tolerance:
+            break
+            
+        else:
+            kMeansMax_value_previous = kMeansMax_value
+          
+        
+    kMeansMax1 = time.time()
+    
+    kMeansMax_time = kMeansMax1 - kMeansMax0
+            
+
+
+    #####
+    # 2 #
+    #####
+
+    def max_cliques(adj_matrix, previous_cliques=None, use_knowledge=False):
+        
+        # create graph
+        G = nx.convert_matrix.from_numpy_array(adj_matrix)
+        # calculation of max cliques
+        maxCliques = max_cliques_optimized(G, previous_cliques, use_knowledge=False)
+        # check for every maximal clique if a node is part of this clique or not.
+        part_of_clique = [{n: [c] if  n in c else [] for n in G } for c in maxCliques]
+        # transform this to a numpy array with 0/1 entries
+        part_of_clique_binar = np.transpose(
+            np.array([[(len(clique[i]) > 0)*1 for i in range(len(clique))] for clique in part_of_clique])
+        )
+        
+        return G, maxCliques, part_of_clique_binar
+
+    #####
+    # 3 #
+    #####
+
+    def max_cliques_optimized(G, previous_cliques=None, use_knowledge=False):
+        result = None
+
+        if use_knowledge:
+            # if previous knowledge is not available
+            if previous_cliques == None:
+                # create subgraph for each node of graph G
+                G_list = [G.subgraph([i for i in G[j]]) for j in range(len(X_num))]
+
+                # calculate and return maximal cliques for each subgraph
+                maxCliques = [list(nx.algorithms.clique.find_cliques(g)) for g in G_list]
+
+                unnest_maxCliques = [c for sublist in maxCliques for c in sublist]
+
+                result = [list(i) for i in set(map(lambda i: tuple(sorted(i)), unnest_maxCliques))]
+
+            # if previous knowledge is available
+            else:
+                # create subgraph for each node of graph G
+                G_list = [G.subgraph(j) for j in previous_cliques]
+
+                # calculate and return maximal cliques for each subgraph
+                maxCliques = [list(nx.algorithms.clique.find_cliques(g)) for g in G_list]
+
+                unnest_maxCliques = [c for sublist in maxCliques for c in sublist]
+
+                result = [list(i) for i in set(map(lambda i: tuple(sorted(i)), unnest_maxCliques))]
+
+
+        else:
+            # standard algorithm
+            result = list(nx.algorithms.clique.find_cliques(G))
+
+        return result
+
+    #####
+    # 4 #
+    #####
+
+    def set_cover(maxCliques, part_of_clique_binar, number_of_clusters):
+        # create ILP model
+        model = plp.LpProblem("SetCoverProblem", plp.LpMinimize)
+
+        # decision variables (one for each clique)
+        x = plp.LpVariable.dicts("Clique",
+                                        [i for i in range(len(maxCliques))],
+                                        lowBound=0,
+                                        upBound=1,
+                                        cat='Integer')
+
+        # minimize the number of cliques
+        model += plp.lpSum([x[i]] for i in range(len(maxCliques)))
+
+        # each data point has to be included in at least one selected clique
+        for element in part_of_clique_binar:
+                model += plp.lpSum([element[i]*x[i] for i in range(len(element))]) >= 1
+
+        # restrict the number of cliques to k
+        model += plp.lpSum([x[i] for i in range(len(maxCliques))]) <= number_of_clusters
+
+        #model.solve(plp.GUROBI(OutputFlag=0))
+        model.solve()
+        
+        status = plp.LpStatus[model.status]
+        # return optimal solution and solver status
+        return x, status
+
+    #####
+    # 5 #
+    #####
+
+    def set_cover_infeasible(distance_matrix, current_value, number_of_clusters):
+
+        adj_matrix = distance_matrix <= current_value
+
+        # empty set to collect isolated nodes
+        isolated_nodes = []
+
+        # initialize lower bound
+        lower_bound = 0
+
+        # iterate over each node
+        for i in range(len(X_num)):
+            # variable to store information about match in any nested list
+            no_match = True
+
+            # iterate over each isolated group
+            for j in range(len(isolated_nodes)):
+                node_match = False
+
+                # iterate over each node of one isolated group
+                for k in range(len(isolated_nodes[j])):
+
+                    # check match for every node in nested list
+                    if adj_matrix[i,isolated_nodes[j][k]]:
+                        # match found to isolated group
+                        node_match = True
+                        break
+
+                # append to nested list if no node match found
+                if not node_match:
+                    isolated_nodes[j].append(i)
+                    no_match = False
+                    lower_bound = max(lower_bound,len(isolated_nodes[j]))
+                    break
+
+            # create new nested list
+            if no_match:
+                isolated_nodes.append([i])
+                lower_bound = max(lower_bound,1)
+
+            if lower_bound > number_of_clusters:
+                break
+
+        # get maximum number of nodes in any nested list
+        lower_bound = max(len(x) for x in isolated_nodes)
+
+        if(lower_bound <= number_of_clusters):
+
+            # try to add a node to existing nested lists. No new nested lists will be created
+            for i in range(len(X_num)):
+
+                for j in range(len(isolated_nodes)):
+                    node_match = False
+
+                    # iterate over each node of one isolated group
+                    for k in range(len(isolated_nodes[j])):
+
+                        if adj_matrix[i,isolated_nodes[j][k]]:
+
+                            # match found to isolated group
+                            node_match = True
+                            break
+
+                    if not node_match:
+                        isolated_nodes[j].append(i)
+                        lower_bound = max(lower_bound,len(isolated_nodes[j]))
+
+
+                    if lower_bound > number_of_clusters:
+                        break
+
+                if lower_bound > number_of_clusters:
+                    break
+
+        result = lower_bound > number_of_clusters
+
+        if result:
+            print("Infeasible solution found for value: " + str(current_value))
+
+        return result, lower_bound
+
+    #####
+    # 6 #
+    #####
+
+    def iteration(distance_matrix, current_value, number_of_clusters, previous_cliques=None, use_knowledge=False):
+
+        print("Iteration for value: " + str(current_value))
+
+        # algorithm can be skipped if an infeasible solution is found.
+        infeasible, lower_bound_set_cover = set_cover_infeasible(distance_matrix, current_value, number_of_clusters)
+
+        maxCliques = []
+        x = None
+        status = "Infeasible"
+
+        # change variables above if solution could be feasible
+        if not infeasible:
+
+            print("Subproblems have to be solved!")
+            adj_matrix = distance_matrix <= current_value
+
+            # calculate maximal cliques
+            G, maxCliques, part_of_clique_binar = max_cliques(adj_matrix, previous_cliques, use_knowledge)
+
+            print("Max Clique size: " + str(len(maxCliques)))
+
+            print("Max Clique problem solved for value: " + str(current_value))
+
+
+            # solve the set cover problem for the dataset and maximal cliques
+            x, status = set_cover(maxCliques, part_of_clique_binar, number_of_clusters)
+
+            print("Set cover problem solved for value: " + str(current_value))
+
+        return maxCliques, x, status
+
+    #####
+    # 7 #
+    #####
+
+    def create_cluster_labels(MILP_solution, cliques):
+
+        # improve upper bound as far as possible
+        maxCurrentCover = np.array(cliques, dtype='object')
+
+        # update variable maxCurrentCover
+        if MILP_solution != None:
+            partOfCurrentCover = [MILP_solution[i].varValue > 0 for i in range(len(MILP_solution))]
+            maxCurrentCover = maxCurrentCover[partOfCurrentCover]
+
+        maxCurrentLabels = np.ones(len(X_num))
+
+        # set cluster labels
+        for i in range(len(maxCurrentCover)):
+            maxCurrentLabels[np.array(maxCurrentCover[i],dtype='i')] = i
+
+
+        return maxCurrentLabels
+
+    #####
+    # 8 #
+    #####
+
+    def bisection_method(lower_bound, upper_bound, error_tolerance, distance_matrix, number_of_clusters, use_knowledge=False):
+        # debug info
+        print("Upper bound: " + str(upper_bound) + " - Lower bound: " + str(lower_bound))
+
+        # k-means cliques and labels
+        current_cliques = [[i for i in range(len(X_num)) if labels[i] == j] for j in range(number_of_clusters)]
+        current_labels = create_cluster_labels(None, current_cliques)
+
+        # check if current upper bound is already the optimal solution (this is useful if k-means is used beforehand)
+        current_value = upper_bound - 0.5 * error_tolerance
+
+        maxCliques, x, status = iteration(distance_matrix, current_value, number_of_clusters, current_cliques, use_knowledge)
+
+        if(status =="Infeasible"):
+            lower_bound = current_value
+        else:
+            upper_bound = current_value
+
+        while (upper_bound - lower_bound) > error_tolerance:
+            # update current_value
+            current_value = 0.8 * upper_bound + 0.2 * lower_bound
+
+            print("Upper bound: " + str(upper_bound) + " - Lower bound: " + str(lower_bound))
+
+            # calculate max cliques and set cover for current_value
+            maxCliques, x, status = iteration(distance_matrix, current_value, number_of_clusters, current_cliques, use_knowledge)
+
+            # update lower / upper bound
+            if(status =="Infeasible"):
+                lower_bound = current_value
+            else:
+                # save current cliques
+                current_cliques = maxCliques
+                current_labels = create_cluster_labels(x, maxCliques)
+
+                # set upper bound based on feasible solution
+                upper_bound =   max(
+                        # max distance between data points for each current cluster
+                        [np.nanmax(
+                                    np.asmatrix(
+                                            # get pairwise distances for current cluster i
+                                            pairwise_distances(X_num[current_labels==i], metric="chebyshev")
+                                    )
+                        ) for i in range(number_of_clusters) if len(X_num[current_labels==i]) != 0]
+                    )
+
+        return upper_bound, current_cliques, current_labels
+
+    #####
+    # 9 #
+    #####
+
+    t0 = time.time()
+
+
+    # get maximal pairwise distance (chebyshev) within k-means clusters.
+    # This is the upper bound for the algorithm (feasible solution of the clustering problem)
+
+    k_means_upper_bound = max(
+                        # max distance between data points for each k-means cluster
+                        [np.nanmax(
+                                    np.asmatrix(
+                                            # get pairwise distances for k-means cluster i
+                                            pairwise_distances(X_num[labels==i], metric="chebyshev")
+                                    )
+                        ) for i in range(number_of_clusters) if len(X_num[labels==i]) != 0]
+                    )
+
+
+    upper_bound = k_means_upper_bound
+
+    optimal_value, optimal_cliques, optimal_labels = bisection_method(lower_bound, upper_bound, error_tolerance, distance_matrix, number_of_clusters, True)
+
+    t1 = time.time()
+
+    print("-------------------------------------------------------------")
+    print("Calulation of the bisection is finished. Starting with big M ")
+    print("-------------------------------------------------------------")
+
+    bigM_status = None
+    bigM_optimal_value = None
+    bigM_z_vars = None
+    bigM_y_vars = None
+    bigM_time = None
+
+    if(bigMIncluded):
+        # Big M reformulation as the last one: The problem is solved using PuLP's choice of Solver and time is measured
+        start_time = time.time()  # Start time measurement
+        #solver_model = plp.GUROBI(OutputFlag=0)
+        prob.solve()
+        end_time = time.time()  # End time measurement
+        bigM_time = end_time - start_time  # Calculate time taken
+
+
+    if (bigMIncluded):
+        bigM_status = plp.LpStatus[prob.status]
+        bigM_optimal_value = 2*plp.value(prob.objective)
+        print('Opt Value bigM: ' + str(bigM_optimal_value))
+        bigM_z_vars = z_vars
+        bigM_y_vars = y_vars
+
+    
+    
+    return {'bigM_status': bigM_status,
+            'bigM_optimal_value': bigM_optimal_value,
+            'bigM_z_vars': bigM_z_vars,
+            'bigM_y_vars': bigM_y_vars,
+            'bigM_time': bigM_time,
+            'bisec_optimal_value': optimal_value,
+            'bisec_label': optimal_labels,
+            'bisec_time': t1-t0+k_time,
+            'kMeans_value_solver': kMeans_value,
+            'kMeans_center': centers,
+            'kMeans_label': labels,
+            'kMeans_time': k_time,
+            'kMeansMax_center': kMeansMaxCenters,
+            'kMeansMax_label': kMeansMaxLabels,
+            'kMeansMax_time': kMeansMax_time,
+            'data': X_num,
+            'seed_number': seed_number
+           }
+
+
+# In[4]:
+
+
+bigMIncluded = True
+list_seed_number = [1,2,3,4,5]
+list_number_of_dimensions = [4,6,10]
+list_number_of_clusters = [4]
+list_data_points_per_cluster = [7,10]
+
+list_sigma=[5,10,15]
+error_tolerance = 0.0000001
+
+
+# In[5]:
+
+
+def localize_floats(row):
+    return [
+        str(el).replace('.', ',') if isinstance(el, float) else el
+        for el in row
+    ]
+
+
+# In[6]:
+
+
+# Open a CSV file for writing
+drive_csv_file_path = 'D://Data/statistics' + str(int(time.time())) + '.csv'
+
+with open(drive_csv_file_path, mode='w', newline='') as file:
+
+    writer = csv.writer(file, delimiter=';')
+    writer.writerow(
+        [  'number_of_dimensions'
+         , 'number_of_clusters'
+         , 'data_points_per_cluster'
+         , 'sigma'
+         , 'bigM_status'
+         , 'bigM_optimal_value'
+         , 'bigM_value_euclidean'
+         , 'bigM_value_infinity'
+         , 'bigM_inner_distance_euclidean'
+         , 'bigM_inner_distance_infinity'
+         , 'bigM_outer_distance_euclidean'
+         , 'bigM_outer_distance_infinity'
+         , 'bigM_time'
+         , 'bisec_optimal_value' ## f^star _ OLD (mit der infty norm)
+         , 'bisec_time' # time_new (= time_old)
+         , 'bisec_value_euclidean' ## f^star _ NEW (mit der eucl. norm)
+         , 'bisec_value_infinity'  # musste eigentlich gleich dem wert bisec_optimal_value
+         , 'bisec_inner_distance_euclidean' ## delta_I_NEW
+         , 'bisec_inner_distance_infinity' ## delta_I_OLD
+         , 'bisec_outer_distance_euclidean' ## delta_O_NEW
+         , 'bisec_outer_distance_infinity' ## delta_O_OLD
+         , 'bisec_kMeans_value_ratio_euclidean' ## f^star_NEW / f^k_NEW
+         , 'bisec_kMeans_value_ratio_infinity' ## f^star_OLD / f^k_OLD
+         , 'bisec_kMeansMax_value_ratio_infinity'
+         , "kMeans_time" ## k_means_time_NEW (=k_mean_time_OLD)
+         , "kMeans_value_solver"
+         , 'kMeans_value_euclidean' ## f^k_NEW
+         , 'kMeans_value_infinity' ## f^k_OLD
+         , 'kMeans_inner_distance_euclidean'
+         , 'kMeans_inner_distance_infinity'
+         , 'kMeans_outer_distance_euclidean'
+         , 'kMeans_outer_distance_infinity'
+         , "kMeansMax_time"
+         , 'kMeansMax_value_infinity'
+         , 'kMeansMax_inner_distance_euclidean'
+         , 'kMeansMax_inner_distance_infinity'
+         , 'kMeansMax_outer_distance_euclidean'
+         , 'kMeansMax_outer_distance_infinity'
+         , 'seed_number'
+        ]
+    )  # Write header
+
+    counter = 0
+
+    total = len(list_seed_number)*len(list_number_of_dimensions)*len(list_number_of_clusters)*len(list_data_points_per_cluster)*len(list_sigma)
+
+    # Nested loop over x, y, and z
+    for seed_number in list_seed_number:
+
+
+        for number_of_dimensions in list_number_of_dimensions:
+            for number_of_clusters in list_number_of_clusters:
+                for data_points_per_cluster in list_data_points_per_cluster:
+                    for sigma in list_sigma:
+
+                        counter = counter + 1
+
+                        print(f"counter/total =  {counter},{total}")
+
+                        print(f"Currently executed level is (num_dim,num_cluster,num_points_per_cluster,sigma,seed_number) =  {number_of_dimensions},{number_of_clusters},{data_points_per_cluster},{sigma},{seed_number}")
+
+                        result_dict = compute_big_M_and_bisection(number_of_dimensions,
+                                                                  number_of_clusters,
+                                                                  data_points_per_cluster,
+                                                                  sigma,
+                                                                  error_tolerance,
+                                                                  seed_number,
+                                                                  bigMIncluded)# Perform computation
+
+
+
+
+                        X_num = result_dict['data']
+
+                        bisec_value_euclidean = 0
+                        kMeans_value_euclidean = 0
+                        bigM_value_euclidean = 0
+                        bisec_value_infinity = 0
+                        kMeans_value_infinity = 0
+                        kMeansMax_value_infinity = 0
+                        bigM_value_infinity = 0
+
+                        bigM_inner_distance_euclidean = None
+                        bigM_inner_distance_infinity = None
+                        bigM_outer_distance_euclidean = None
+                        bigM_outer_distance_infinity= None
+
+                        if (bigMIncluded):
+                            bigM_z_vars = result_dict['bigM_z_vars']
+                            bigM_y_vars = result_dict['bigM_y_vars']
+  
+                            bigM_center = np.array(
+                                [
+                                    [
+                                        bigM_z_vars['z_' + str(j+1) + '_' + str(i+1)].value() for j in range(number_of_dimensions)
+                                    ]
+                                    for i in range(number_of_clusters)
+                                ]
+                            )
+  
+                            bigM_label = np.sum(np.array(
+                                [
+                                    [
+                                        bigM_y_vars['y_'+str(j+1)+'_' + str(i+1)].value() for i in range(number_of_clusters)
+                                    ] for j in range(X_num.shape[0])
+                                ]
+                            ) * (np.array(range(number_of_clusters)) + 1),axis=1) - 1
+  
+                            # calculate values for bigM method
+                            for i in range(number_of_clusters):
+                              currentCluster = X_num[bigM_label==i]
+                              currentCenter = bigM_center[i]
+  
+                              bigM_value_euclidean += np.sum(
+                                  pow(np.linalg.norm(currentCluster-currentCenter,axis=1),2)
+                              )
+  
+                              bigM_value_infinity = max(
+                                  max(
+                                      np.linalg.norm(currentCluster-currentCenter,np.inf,axis=1)
+                                  ), bigM_value_infinity
+                              )
+
+                              '''
+                              bigM_outer_distance_euclidean = min(
+                                  [
+                                      np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                      for j in range(len(X_num)) if bigM_label[i] != bigM_label[j] and i > j
+                                  ]
+                              )
+                              '''
+      
+                              bigM_outer_distance_infinity = min(
+                                  [
+                                      max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                      for j in range(len(X_num)) if bigM_label[i] != bigM_label[j] and i > j
+                                  ]
+                              )
+                              '''
+                              bigM_inner_distance_euclidean = max(
+                                  [
+                                      np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                      for j in range(len(X_num)) if bigM_label[i] == bigM_label[j] and i > j
+                                  ]
+                              )
+                              '''
+      
+                              bigM_inner_distance_infinity = max(
+                                  [
+                                      max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                      for j in range(len(X_num)) if bigM_label[i] == bigM_label[j] and i > j
+                                  ]
+                              )
+
+
+
+
+                        # calculate values for bisection method
+                        bisec_label = result_dict['bisec_label']
+
+                        for i in range(number_of_clusters):
+                            currentCluster = X_num[bisec_label==i]
+                            cluster_min = currentCluster.min(axis=0)
+                            cluster_max = currentCluster.max(axis=0)
+                            currentCenter = (cluster_min + cluster_max) / 2
+                            bisec_value_euclidean += np.sum(
+                                pow(np.linalg.norm(currentCluster-currentCenter,axis=1),2)
+                            )
+
+                            bisec_value_infinity = max(
+                                max(
+                                    np.linalg.norm(currentCluster-currentCenter, np.inf,axis=1)
+                                ), bisec_value_infinity
+                            )
+                            
+                        bisec_outer_distance_euclidean = None
+                        '''
+                        bisec_outer_distance_euclidean = min(
+                            [
+                                np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                for j in range(len(X_num)) if bisec_label[i] != bisec_label[j] and i > j
+                            ]
+                        )
+                        '''
+                        
+                        bisec_outer_distance_infinity = min(
+                            [
+                                max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                for j in range(len(X_num)) if bisec_label[i] != bisec_label[j] and i > j
+                            ]
+                        )
+                        
+                        bisec_inner_distance_euclidean = None
+                        '''
+                        bisec_inner_distance_euclidean = max(
+                            [
+                                np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                for j in range(len(X_num)) if bisec_label[i] == bisec_label[j] and i > j
+                            ]
+                        )
+                        '''
+                        
+                        bisec_inner_distance_infinity = max(
+                            [
+                                max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                for j in range(len(X_num)) if bisec_label[i] == bisec_label[j] and i > j
+                            ]
+                        )
+                        
+                        print("Bisec evaluation done")
+
+
+                        # calculate values for kmeans method
+                        kMeans_label = result_dict['kMeans_label']
+                        kMeans_center = result_dict['kMeans_center']
+
+                        for i in range(number_of_clusters):
+                            currentCluster = X_num[kMeans_label==i]
+                            currentCenter = kMeans_center[i]
+
+                            kMeans_value_euclidean += np.sum(
+                                pow(
+                                    np.linalg.norm(currentCluster-currentCenter, axis=1),2
+                                )
+                            )
+
+                            kMeans_value_infinity = max(
+                                max(
+                                    np.linalg.norm(currentCluster-currentCenter, np.inf,axis=1)
+                                ), kMeans_value_infinity
+                            )
+                        
+                        kMeans_outer_distance_euclidean = None
+                        '''
+                        kMeans_outer_distance_euclidean = min(
+                            [
+                                np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeans_label[i] != kMeans_label[j] and i > j
+                            ]
+                        )
+                        '''
+
+                        kMeans_outer_distance_infinity = min(
+                            [
+                                max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeans_label[i] != kMeans_label[j] and i > j
+                            ]
+                        )
+                        
+                        kMeans_inner_distance_euclidean = None
+                        '''
+                        kMeans_inner_distance_euclidean = max(
+                            [
+                                np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeans_label[i] == kMeans_label[j] and i > j
+                            ]
+                        )
+                        '''
+
+                        kMeans_inner_distance_infinity = max(
+                            [
+                                max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeans_label[i] == kMeans_label[j] and i > j
+                            ]
+                        )
+                        
+                        
+                        print("kMeans evaluation done")
+                        
+                        
+                        # calculate values for kmeans Max method
+                        kMeansMax_label = result_dict['kMeansMax_label']
+                        kMeansMax_center = result_dict['kMeansMax_center']
+
+                        for i in range(number_of_clusters):
+                            currentCluster = X_num[kMeansMax_label==i]
+                            currentCenter = kMeansMax_center[i]
+
+                            kMeansMax_value_infinity = max(
+                                max(
+                                    np.linalg.norm(currentCluster-currentCenter, np.inf,axis=1)
+                                ), kMeansMax_value_infinity
+                            )
+
+                        kMeansMax_outer_distance_euclidean = None 
+                        '''
+                        kMeansMax_outer_distance_euclidean = min(
+                            [
+                                np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeansMax_label[i] != kMeansMax_label[j] and i > j
+                            ]
+                        )
+                        '''
+
+                        kMeansMax_outer_distance_infinity = min(
+                            [
+                                max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeansMax_label[i] != kMeansMax_label[j] and i > j
+                            ]
+                        )
+                        
+                        kMeansMax_inner_distance_euclidean = None
+                        '''
+                        kMeansMax_inner_distance_euclidean = max(
+                            [
+                                np.linalg.norm(X_num[i] - X_num[j]) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeansMax_label[i] == kMeansMax_label[j] and i > j
+                            ]
+                        )
+                        '''
+
+                        kMeansMax_inner_distance_infinity = max(
+                            [
+                                max(abs(X_num[i]-X_num[j])) for i in range(len(X_num))
+                                for j in range(len(X_num)) if kMeansMax_label[i] == kMeansMax_label[j] and i > j
+                            ]
+                        )
+                        
+                        print("kMeans Max evaluation done")
+
+
+
+                        writer.writerow(localize_floats([number_of_dimensions,
+                                                         number_of_clusters,
+                                                         data_points_per_cluster,
+                                                         sigma,
+                                                         result_dict['bigM_status'],
+                                                         result_dict['bigM_optimal_value'],
+                                                         bigM_value_euclidean,
+                                                         bigM_value_infinity,
+                                                         bigM_inner_distance_euclidean,
+                                                         bigM_inner_distance_infinity,
+                                                         bigM_outer_distance_euclidean,
+                                                         bigM_outer_distance_infinity,
+                                                         result_dict['bigM_time'],
+                                                         result_dict['bisec_optimal_value'],
+                                                         result_dict['bisec_time'],
+                                                         bisec_value_euclidean,
+                                                         bisec_value_infinity,
+                                                         bisec_inner_distance_euclidean,
+                                                         bisec_inner_distance_infinity,
+                                                         bisec_outer_distance_euclidean,
+                                                         bisec_outer_distance_infinity,
+                                                         bisec_value_euclidean / kMeans_value_euclidean,
+                                                         bisec_value_infinity / kMeans_value_infinity,
+                                                         bisec_value_infinity / kMeansMax_value_infinity,
+                                                         result_dict['kMeans_time'],
+                                                         result_dict['kMeans_value_solver'],
+                                                         kMeans_value_euclidean,
+                                                         kMeans_value_infinity,
+                                                         kMeans_inner_distance_euclidean,
+                                                         kMeans_inner_distance_infinity,
+                                                         kMeans_outer_distance_euclidean,
+                                                         kMeans_outer_distance_infinity,
+                                                         result_dict['kMeansMax_time'],
+                                                         kMeansMax_value_infinity,
+                                                         kMeansMax_inner_distance_euclidean,
+                                                         kMeansMax_inner_distance_infinity,
+                                                         kMeansMax_outer_distance_euclidean,
+                                                         kMeansMax_outer_distance_infinity,
+                                                         seed_number])
+                                        )  # Write to CSV
+
